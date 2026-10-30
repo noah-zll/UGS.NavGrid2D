@@ -1,0 +1,21 @@
+{
+  "name": "com.ugs.navgrid2d",
+  "version": "0.1.0",
+  "displayName": "UGS.NavGrid2D",
+  "description": "A gameplay-agnostic 2D grid navigation framework: uniform grid, 8-way A*, path smoothing, crowd-aware avoidance and agent follow, with incremental rebuild from pluggable obstacle sources.",
+  "unity": "2021.3",
+  "keywords": [
+    "navigation",
+    "pathfinding",
+    "grid",
+    "astar",
+    "avoidance",
+    "2d",
+    "framework"
+  ],
+  "author": {
+    "name": "Noah",
+    "email": "noah-zhou@qq.com",
+    "url": "https://github.com/noah-zll?tab=repositories"
+  }
+}
