@@ -32,6 +32,9 @@ namespace UGS.NavGrid2D
         /// <summary>上一次真正参与寻路的目标（Partial 路径也要靠它判断"目标没变、可以复用"）。</summary>
         private Vector2 _requestTarget;
 
+        /// <summary>上一次发起寻路时的位置：位置明显变了就说明情况变了，不能继续复用旧结果。</summary>
+        private Vector2 _pathOrigin;
+
         /// <summary>
         /// 预算内搜不完时的重试启发权重：强启发会贴着障碍朝目标推进，展开量小得多，
         /// 代价是路径可能略长。只在正常搜索失败后才用。
@@ -47,6 +50,17 @@ namespace UGS.NavGrid2D
 
         /// <summary>路径被截断时最多再补几段（每段一次 A*）。</summary>
         private const int MaxStitchSegments = 1;
+
+        /// <summary>停滞判定：0.5 秒内位移不到 0.12 世界单位就算"推不动"。</summary>
+        private const float StallTime = 0.5f;
+        private const float StallDistance = 0.12f;
+
+        /// <summary>推不动之后先停这么久再重试：比一直在原地挤、一直抖要自然。</summary>
+        private const float StallHold = 0.25f;
+
+        private Vector2 _progressPosition;
+        private float _stallTimer;
+        private float _blockedHold;
 
         private readonly List<NavPathPoint> _stitchBuffer = new List<NavPathPoint>(256);
 
@@ -235,8 +249,10 @@ namespace UGS.NavGrid2D
 
             // 没有路径（已走到断点或被清空）且目标没变：在重算间隔内直接返回上次结果。
             // 目标不可达时上层每 0.3 秒重发一次请求，不挡的话会不停跑长搜索，表现为持续掉帧。
+            // 但如果这期间单位自己挪动了（被人群挤开、蹭着散开），情况已经变了，得重算。
             if (!HasPath && Time.time < _nextRepathTime &&
-                (target - _requestTarget).sqrMagnitude <= _targetToleranceSqr)
+                (target - _requestTarget).sqrMagnitude <= _targetToleranceSqr &&
+                (Position - _pathOrigin).sqrMagnitude <= 0.25f)
             {
                 return _lastStatus;
             }
@@ -274,6 +290,7 @@ namespace UGS.NavGrid2D
 
             _requestTarget = target;
             _nextRepathTime = Time.time + _repathInterval + _repathJitter;
+            _pathOrigin = Position;
 
             NavPathStatus status = _system.CalculatePath(Position, Layer, target, targetLayer, AreaMask, Radius,
                 _calculateBuffer, IgnoreCrowd, MaxPathExpansions, MaxPathMilliseconds);
@@ -402,6 +419,7 @@ namespace UGS.NavGrid2D
             _asyncTarget = target;
             _requestTarget = target;
             _nextRepathTime = Time.time + _repathInterval + _repathJitter;
+            _pathOrigin = Position;
 
             // 结果还没回来：先按"已接受"回给上层（返回 Invalid 会让上层当作走不过去而停住）
             return _lastStatus != NavPathStatus.Invalid ? _lastStatus : NavPathStatus.Partial;
@@ -450,6 +468,9 @@ namespace UGS.NavGrid2D
 
             _cornerIndex = 0;
             _stuckTimer = 0f;
+            _stallTimer = 0f;
+            _blockedHold = 0f;
+            _progressPosition = Position;
             PathEndPosition = target;
 
             if (_corners.Count == 0)
@@ -508,6 +529,9 @@ namespace UGS.NavGrid2D
             _nextRepathTime = 0f;
             _hasCompletePath = false;
             _hasPendingDestination = false;
+            _stallTimer = 0f;
+            _blockedHold = 0f;
+            _progressPosition = Position;
             Velocity = Vector2.zero;
             PathEndPosition = Position;
         }
@@ -598,12 +622,48 @@ namespace UGS.NavGrid2D
             }
 
             // 推进已走过的路点
-            while (_cornerIndex < _corners.Count - 1 &&
-                   (_corners[_cornerIndex].Position - position).sqrMagnitude <= _waypointReachSqr)
+            while (_cornerIndex < _corners.Count - 1)
             {
+                Vector2 corner = _corners[_cornerIndex].Position;
+
+                // 已经走到（或越过）该路点就推进。
+                // 只按"距离 < WaypointReach"判定会在贴着建筑角时卡死：路点被墙角挤住，
+                // 单位永远进不了那个半径，于是一直朝它拐、被推回来，表现为原地抽搐。
+                bool passed = (corner - position).sqrMagnitude <= _waypointReachSqr;
+                if (!passed)
+                {
+                    Vector2 ahead = _corners[_cornerIndex + 1].Position - corner;
+                    if (ahead.sqrMagnitude > 1e-6f &&
+                        Vector2.Dot(position - corner, ahead) > 0.25f * ahead.magnitude)
+                    {
+                        passed = true;
+                    }
+                }
+
+                if (!passed)
+                {
+                    break;
+                }
+
                 // 跨层：到达门户起点就切到目标层，后续寻路从这里出发
                 Layer = _corners[_cornerIndex + 1].Layer;
                 _cornerIndex++;
+            }
+
+            // 挤不动就原地抖：位置几乎不前进却一直在推。检测到停滞先停一小会儿再试，
+            // 比持续抖动自然；停住期间照常做分离，不会被别人推穿。
+            UpdateStall(position, dt);
+            if (_blockedHold > 0f)
+            {
+                Velocity = Vector2.zero;
+                _stuckTimer += dt;
+
+                if (AvoidanceEnabled)
+                {
+                    AvoidanceSolver.ResolveOverlap(_system, this, dt);
+                }
+
+                return;
             }
 
             Vector2 steer = _corners[_cornerIndex].Position;
@@ -639,6 +699,26 @@ namespace UGS.NavGrid2D
             Velocity = nextVelocity;
 
             Vector2 nextPosition = position + Velocity * dt;
+            if (!CanStand(nextPosition))
+            {
+                // 这一步会走进非通行格：先试单轴滑动，实在不行就停下等下一帧
+                Vector2 slideX = new Vector2(nextPosition.x, position.y);
+                Vector2 slideY = new Vector2(position.x, nextPosition.y);
+                if (CanStand(slideX))
+                {
+                    nextPosition = slideX;
+                }
+                else if (CanStand(slideY))
+                {
+                    nextPosition = slideY;
+                }
+                else
+                {
+                    nextPosition = position;
+                    Velocity = Vector2.zero;
+                }
+            }
+
             if (_transform != null)
             {
                 _transform.position = new Vector3(nextPosition.x, nextPosition.y, _transform.position.z);
@@ -658,6 +738,63 @@ namespace UGS.NavGrid2D
             {
                 _stuckTimer = 0f;
             }
+        }
+
+        /// <summary>
+        /// 停滞检测：有路径但位置推不动时，先原地停一小会儿再重试。
+        /// 只按速度判"卡住"是不够的——被人墙挡住时速度是有的（一直在推、在左右滑），
+        /// 只有位置不前进，表现就是原地抖。
+        /// </summary>
+        private void UpdateStall(Vector2 position, float dt)
+        {
+            if (_blockedHold > 0f)
+            {
+                _blockedHold -= dt;
+                return;
+            }
+
+            float required = StallDistance * StallDistance;
+            if ((position - _progressPosition).sqrMagnitude > required)
+            {
+                _progressPosition = position;
+                _stallTimer = 0f;
+                return;
+            }
+
+            _stallTimer += dt;
+            if (_stallTimer < StallTime)
+            {
+                return;
+            }
+
+            _stallTimer = 0f;
+            _progressPosition = position;
+            _blockedHold = StallHold;
+        }
+
+        /// <summary>
+        /// 该点在本层是否站得住（按自身半径查 clearance）。
+        /// </summary>
+        /// <remarks>
+        /// 当前位置本来就不可站（正在爬梯子/门户穿越、或刚被挤进墙边）时直接放行，
+        /// 否则门户那一段会被自己拦下来。
+        /// 加这层拦挡是为了不让单位走进非通行格：一旦走进去，上层会把它"纠正"回最近可走格，
+        /// 下一帧路径又指向同一个墙角，就成了原地抽搐。
+        /// </remarks>
+        private bool CanStand(Vector2 point)
+        {
+            NavGrid grid = _system != null ? _system.Grid : null;
+            if (grid == null)
+            {
+                return true;
+            }
+
+            if (grid.IsPassable(Layer, point, AreaMask, Radius))
+            {
+                return true;
+            }
+
+            return !grid.IsPassable(Layer, Position, AreaMask, Radius);
         }
     }
 }

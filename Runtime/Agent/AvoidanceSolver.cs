@@ -24,6 +24,13 @@ namespace UGS.NavGrid2D
         /// <summary>邻居查询余量（世界单位）。</summary>
         private const float NeighborMargin = 2.5f;
 
+        /// <summary>
+        /// 方向粘性：给"和当前速度同向"的候选加分。
+        /// 拥挤时左右两个对称方向的得分几乎一样，没有这一项就会逐帧翻边，看起来是来回抖。
+        /// 权重明显小于 <c>Dot(dir, desiredDir)</c>，所以真需要转向时照样转得过去。
+        /// </summary>
+        private const float DirectionStickiness = 0.5f;
+
         private static readonly List<GridAgent> Neighbors = new List<GridAgent>(32);
 
         /// <summary>在给定期望速度的基础上选一个会绕开邻居的方向。</summary>
@@ -47,6 +54,11 @@ namespace UGS.NavGrid2D
             float lookAhead = Mathf.Max(speed * PredictionTime, MinLookAhead);
             float selfRadius = agent.Radius;
 
+            // 当前实际朝向：用来给候选方向加"别突然换边"的粘性分
+            Vector2 currentDir = agent.Velocity.sqrMagnitude > 0.0001f
+                ? agent.Velocity.normalized
+                : desiredDir;
+
             float bestScore = float.MinValue;
             Vector2 bestDir = desiredDir;
             bool found = false;
@@ -62,7 +74,7 @@ namespace UGS.NavGrid2D
                     continue;
                 }
 
-                float score = Vector2.Dot(dir, desiredDir);
+                float score = Vector2.Dot(dir, desiredDir) + DirectionStickiness * Vector2.Dot(dir, currentDir);
 
                 for (int n = 0; n < Neighbors.Count; n++)
                 {
@@ -111,10 +123,19 @@ namespace UGS.NavGrid2D
                 return desiredVelocity;
             }
 
-            // 最优方向也偏得厉害：说明四周都被堵住了，停下来等，而不是绕着人群转圈
+            // 最优方向也偏得厉害：被附近的单位堵住了。
+            // 这里既不能全体停下（互相等着 = 死锁，谁都不动），
+            // 也不能全体都蹭（16 方向里选出来的最优方向会左右翻转，表现为来回挤）。
+            // 改成按「避障优先级 → Id」让行：同一堆里只有 Id 最小的那个往前推，其余原地等。
+            // 它走开之后下一个自然解除封锁，所以不会死锁，也不会来回换方向。
             if (bestScore < settings.StopScoreThreshold)
             {
-                return Vector2.zero;
+                if (HasHigherPriorityBlocker(agent, desiredDir, position))
+                {
+                    return Vector2.zero;
+                }
+
+                return desiredDir * (speed * 0.35f);
             }
 
             // 就算一直在赔分也保留一点速度，避免原地僵死
@@ -213,6 +234,40 @@ namespace UGS.NavGrid2D
             {
                 agent.Nudge(yOnly);
             }
+        }
+
+        /// <summary>
+        /// 前进方向上是否有比自己更优先的单位（数值小的优先级更高，同级按 Id 小的优先）。
+        /// 有就让行，没有就自己往前推：一堆单位里永远只有 Id 最小的那个在动，不会互相顶。
+        /// </summary>
+        private static bool HasHigherPriorityBlocker(GridAgent agent, Vector2 desiredDir, Vector2 position)
+        {
+            for (int i = 0; i < Neighbors.Count; i++)
+            {
+                GridAgent other = Neighbors[i];
+
+                Vector2 toOther = other.Position - position;
+                float forward = Vector2.Dot(toOther, desiredDir);
+                if (forward <= 0f)
+                {
+                    // 只让"挡在前进方向上"的人，身后的不管
+                    continue;
+                }
+
+                float reach = agent.Radius + other.Radius + 1f;
+                if (toOther.sqrMagnitude > reach * reach)
+                {
+                    continue;
+                }
+
+                if (other.AvoidancePriority < agent.AvoidancePriority ||
+                    (other.AvoidancePriority == agent.AvoidancePriority && other.Id < agent.Id))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         /// <summary>点到线段的最近距离。</summary>
